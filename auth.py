@@ -130,6 +130,29 @@ class ActorMarcaje:
     dispositivo: Optional[models.Dispositivo] = None
 
 
+def _dispositivo_desde_token(x_device_token: str, db: Session) -> models.Dispositivo:
+    dispositivo = (
+        db.query(models.Dispositivo)
+        .filter(models.Dispositivo.token_hash == hash_token_dispositivo(x_device_token))
+        .first()
+    )
+    if not dispositivo:
+        raise HTTPException(status_code=401, detail="Token de dispositivo inválido")
+    if not dispositivo.activo:
+        raise HTTPException(status_code=403, detail="Dispositivo desactivado")
+    return dispositivo
+
+
+def get_dispositivo_actual(
+    x_device_token: Optional[str] = Header(default=None, alias=DEVICE_TOKEN_HEADER),
+    db: Session = Depends(get_db),
+) -> models.Dispositivo:
+    """Solo para endpoints del teléfono en modo kiosco (header X-Device-Token)."""
+    if not x_device_token:
+        raise HTTPException(status_code=401, detail=f"Falta el header {DEVICE_TOKEN_HEADER}")
+    return _dispositivo_desde_token(x_device_token, db)
+
+
 def get_actor_marcaje(
     token: Optional[str] = Depends(oauth2_scheme_opcional),
     x_device_token: Optional[str] = Header(default=None, alias=DEVICE_TOKEN_HEADER),
@@ -144,15 +167,7 @@ def get_actor_marcaje(
         return ActorMarcaje(empresa_id=usuario.empresa_id, usuario=usuario)
 
     if x_device_token:
-        dispositivo = (
-            db.query(models.Dispositivo)
-            .filter(models.Dispositivo.token_hash == hash_token_dispositivo(x_device_token))
-            .first()
-        )
-        if not dispositivo:
-            raise HTTPException(status_code=401, detail="Token de dispositivo inválido")
-        if not dispositivo.activo:
-            raise HTTPException(status_code=403, detail="Dispositivo desactivado")
+        dispositivo = _dispositivo_desde_token(x_device_token, db)
         return ActorMarcaje(empresa_id=dispositivo.empresa_id, dispositivo=dispositivo)
 
     raise HTTPException(

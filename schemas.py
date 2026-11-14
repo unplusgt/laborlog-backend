@@ -67,6 +67,8 @@ class DispositivoBase(BaseModel):
     nombre: Optional[str] = None
     token_fcm: Optional[str] = None
     licencia: Optional[str] = None
+    # Modo kiosco: obra donde está instalado el teléfono
+    obra_id: Optional[int] = None
 
 class DispositivoCreate(DispositivoBase):
     pass
@@ -109,6 +111,8 @@ class UsuarioAdmin(UsuarioAdminBase):
 
 # Marcaje
 class MarcajeCreate(BaseModel):
+    # Lo genera el teléfono al capturar el marcaje; permite reenviar sin duplicar
+    id: Optional[uuid.UUID] = None
     trabajador_id: uuid.UUID
     obra_id: int
     tipo: str
@@ -118,6 +122,9 @@ class MarcajeCreate(BaseModel):
     lat: Optional[str] = None
     lng: Optional[str] = None
     foto_path: Optional[str] = None
+    precision_metros: Optional[float] = Field(default=None, ge=0)
+    # El teléfono la reporta si detecta una app de GPS falso (Android: isMocked)
+    ubicacion_simulada: bool = False
     # estado_sync y razon_conflicto los decide el servidor; se ignoran si vienen del cliente
 
 class MarcajeResponse(BaseModel):
@@ -135,11 +142,64 @@ class MarcajeResponse(BaseModel):
     estado_sync: Optional[str] = None
     razon_conflicto: Optional[str] = None
     registrado_por: Optional[uuid.UUID] = None
+    precision_metros: Optional[float] = None
+    capturado_offline: bool = False
 
     model_config = ConfigDict(from_attributes=True)
 
 # Alias para compatibilidad
 Marcaje = MarcajeResponse
+
+
+# Envío por lotes desde el teléfono (cola offline)
+MAX_MARCAJES_POR_LOTE = 500
+
+class MarcajeLote(BaseModel):
+    # Hora del teléfono al momento de enviar: sirve para corregir el desfase de su reloj
+    enviado_en: datetime
+    marcajes: list[MarcajeCreate] = Field(max_length=MAX_MARCAJES_POR_LOTE)
+
+class ResultadoMarcaje(BaseModel):
+    id: Optional[uuid.UUID] = None
+    # creado | duplicado (ya se había recibido) | rechazado
+    estado: str
+    codigo: int
+    error: Optional[str] = None
+    marcaje: Optional[MarcajeResponse] = None
+
+class ResultadoLote(BaseModel):
+    hora_servidor: datetime
+    resultados: list[ResultadoMarcaje]
+
+
+# Configuración que descarga el teléfono en modo kiosco
+class KioscoTrabajador(BaseModel):
+    id: uuid.UUID
+    nombre: str
+    codigo_empresa: Optional[str] = None
+    # Último marcaje dentro de la ventana de turno (para proponer ENTRADA o SALIDA sin conexión)
+    ultimo_tipo: Optional[str] = None
+    ultimo_marcaje: Optional[datetime] = None  # UTC
+
+    model_config = ConfigDict(from_attributes=True)
+
+class KioscoObra(BaseModel):
+    id: int
+    nombre: str
+    lat: Optional[str] = None
+    lng: Optional[str] = None
+    radio_metros: Optional[int] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+class KioscoConfig(BaseModel):
+    dispositivo_id: uuid.UUID
+    dispositivo_nombre: Optional[str] = None
+    empresa_nombre: str
+    zona_horaria: str
+    hora_servidor: datetime
+    obra: Optional[KioscoObra] = None
+    trabajadores: list[KioscoTrabajador]
 
 
 class PlanillaResumenItem(BaseModel):

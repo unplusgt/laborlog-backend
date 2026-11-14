@@ -43,6 +43,8 @@ class Dispositivo(Base):
     # SHA-256 del token del dispositivo (el token en claro solo se muestra al crearlo/rotarlo)
     token_hash = Column(String, unique=True, index=True)
     activo = Column(Boolean, nullable=False, default=True)
+    # Modo kiosco: obra donde está instalado el teléfono (solo puede marcar en esa obra)
+    obra_id = Column(Integer, ForeignKey("obras.id"), nullable=True)
 
 class Trabajador(Base):
     __tablename__ = "trabajadores"
@@ -83,3 +85,7 @@ class Marcaje(Base):
     razon_conflicto = Column(String)
     # Usuario (supervisor/admin) que registró el marcaje; NULL si vino de un dispositivo
     registrado_por = Column(UUID(as_uuid=True), ForeignKey("usuarios_admin.id"))
+    # Precisión del GPS reportada por el teléfono (metros)
+    precision_metros = Column(Float)
+    # True si se capturó sin conexión y llegó después por POST /marcajes/lote
+    capturado_offline = Column(Boolean, nullable=False, default=False)

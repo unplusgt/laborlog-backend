@@ -13,6 +13,12 @@ if not DATABASE_URL:
         "Falta la variable de entorno DATABASE_URL. Copia .env.example a .env y complétala."
     )
 
+# El proyecto instala psycopg2-binary. SQLAlchemy 2.1 usa por defecto el driver
+# psycopg (v3) para "postgresql://", así que se fija el driver explícitamente.
+for _prefijo in ("postgresql://", "postgres://"):
+    if DATABASE_URL.startswith(_prefijo):
+        DATABASE_URL = "postgresql+psycopg2://" + DATABASE_URL[len(_prefijo):]
+
 _connect_args = {}
 if DATABASE_URL.startswith("postgresql"):
     _connect_args = {"options": "-c client_encoding=utf8"}

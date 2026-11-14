@@ -2,7 +2,7 @@ import logging
 import os
 import uuid
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
@@ -16,7 +16,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from . import auth, models, schemas
 from .auth import ROLES_ADMIN, ROLES_VALIDOS, ROL_SUPERADMIN
 from .database import get_db
-from .marcajes import registrar_marcaje
+from .marcajes import VENTANA_TURNO, zona_horaria_empresa, registrar_lote, registrar_marcaje
 
 logging.basicConfig(
     level=logging.INFO,
@@ -400,6 +400,32 @@ def create_marcaje_endpoint(
     )
     return nuevo
 
+@app.post("/marcajes/lote", response_model=schemas.ResultadoLote)
+def create_marcajes_lote(
+    lote: schemas.MarcajeLote,
+    db: Session = Depends(get_db),
+    actor: auth.ActorMarcaje = Depends(auth.get_actor_marcaje),
+):
+    """Recibe la cola de marcajes capturados sin conexión por un teléfono.
+
+    - Cada marcaje lleva un `id` generado en el teléfono: reenviar el mismo lote no duplica.
+    - `enviado_en` es la hora del teléfono al enviar; con ella el servidor corrige el
+      desfase de su reloj en cada marcaje.
+    - Siempre responde 200 con el resultado de cada marcaje (creado, duplicado o rechazado
+      con el motivo). El teléfono debe quitar de su cola los creados y duplicados y
+      mostrar los rechazados al supervisor.
+    """
+    ahora = datetime.now(timezone.utc)
+    resultados = registrar_lote(db, lote, actor, ahora)
+    if actor.dispositivo is not None:
+        actor.dispositivo.last_sync = ahora.replace(tzinfo=None)
+        db.commit()
+    resumen = defaultdict(int)
+    for r in resultados:
+        resumen[r.estado] += 1
+    logger.info("Lote de marcajes empresa=%s %s", actor.empresa_id, dict(resumen))
+    return schemas.ResultadoLote(hora_servidor=ahora, resultados=resultados)
+
 @app.get("/marcajes", response_model=list[schemas.Marcaje])
 @app.get("/marcajes/", response_model=list[schemas.Marcaje], include_in_schema=False)
 def read_marcajes(
@@ -467,6 +493,10 @@ def get_dispositivo(
 ):
     return _get_o_404(db, models.Dispositivo, dispositivo_id, _empresa_id_or_500(current_user), "Dispositivo")
 
+def _validar_obra_dispositivo(db: Session, obra_id, empresa_id):
+    if obra_id is not None:
+        _get_o_404(db, models.Obra, obra_id, empresa_id, "Obra")
+
 def _respuesta_con_token(dispositivo: models.Dispositivo, token: str) -> schemas.DispositivoConToken:
     base = schemas.Dispositivo.model_validate(dispositivo).model_dump()
     return schemas.DispositivoConToken(**base, token=token)
@@ -480,10 +510,12 @@ def create_dispositivo(
 ):
     """Registra un dispositivo y devuelve su token. El token solo se muestra esta vez:
     configúralo en el teléfono (header X-Device-Token)."""
+    empresa_id = _empresa_id_or_500(current_user)
+    _validar_obra_dispositivo(db, dispositivo.obra_id, empresa_id)
     token = auth.generar_token_dispositivo()
     db_dispositivo = models.Dispositivo(
         **dispositivo.model_dump(),
-        empresa_id=_empresa_id_or_500(current_user),
+        empresa_id=empresa_id,
         token_hash=auth.hash_token_dispositivo(token),
         activo=True,
     )
@@ -513,8 +545,12 @@ def update_dispositivo(
     db: Session = Depends(get_db),
     current_user: models.UsuarioAdmin = Depends(solo_admin)
 ):
-    db_dispositivo = _get_o_404(db, models.Dispositivo, dispositivo_id, _empresa_id_or_500(current_user), "Dispositivo")
-    for field, value in dispositivo.model_dump(exclude_unset=True).items():
+    empresa_id = _empresa_id_or_500(current_user)
+    db_dispositivo = _get_o_404(db, models.Dispositivo, dispositivo_id, empresa_id, "Dispositivo")
+    cambios = dispositivo.model_dump(exclude_unset=True)
+    if "obra_id" in cambios:
+        _validar_obra_dispositivo(db, cambios["obra_id"], empresa_id)
+    for field, value in cambios.items():
         setattr(db_dispositivo, field, value)
     db.commit()
     db.refresh(db_dispositivo)
@@ -530,6 +566,70 @@ def delete_dispositivo(
     db.delete(db_dispositivo)
     db.commit()
     return {"detail": "Dispositivo deleted successfully"}
+
+# =============================================================================
+# KIOSCO (teléfono instalado en una obra, autenticado con X-Device-Token)
+# =============================================================================
+
+@app.get("/kiosco/config", response_model=schemas.KioscoConfig)
+def get_kiosco_config(
+    db: Session = Depends(get_db),
+    dispositivo: models.Dispositivo = Depends(auth.get_dispositivo_actual),
+):
+    """Lo que el teléfono necesita para marcar sin conexión: su obra (con geocerca),
+    los trabajadores activos de la empresa y la hora del servidor."""
+    empresa = db.query(models.Empresa).filter(models.Empresa.id == dispositivo.empresa_id).first()
+    if empresa is None:
+        raise HTTPException(status_code=500, detail="Dispositivo sin empresa asignada")
+    obra = None
+    if dispositivo.obra_id is not None:
+        obra = (
+            db.query(models.Obra)
+            .filter(models.Obra.id == dispositivo.obra_id)
+            .filter(models.Obra.empresa_id == empresa.id)
+            .first()
+        )
+    trabajadores = (
+        db.query(models.Trabajador)
+        .filter(models.Trabajador.empresa_id == empresa.id)
+        .filter(models.Trabajador.activo.is_not(False))
+        .order_by(models.Trabajador.nombre)
+        .all()
+    )
+    ahora = datetime.now(timezone.utc)
+    tz = zona_horaria_empresa(empresa)
+    desde = ahora.astimezone(tz).replace(tzinfo=None) - VENTANA_TURNO
+    ultimos = {}
+    for m in (
+        db.query(models.Marcaje)
+        .filter(models.Marcaje.empresa_id == empresa.id)
+        .filter(models.Marcaje.timestamp_local >= desde)
+        .order_by(models.Marcaje.timestamp_local.asc())
+    ):
+        ultimos[m.trabajador_id] = m
+    items = []
+    for t in trabajadores:
+        ultimo = ultimos.get(t.id)
+        items.append(schemas.KioscoTrabajador(
+            id=t.id,
+            nombre=t.nombre,
+            codigo_empresa=t.codigo_empresa,
+            ultimo_tipo=(ultimo.tipo or "").lower() if ultimo else None,
+            ultimo_marcaje=(
+                ultimo.timestamp_local.replace(tzinfo=tz).astimezone(timezone.utc) if ultimo else None
+            ),
+        ))
+    dispositivo.last_sync = ahora.replace(tzinfo=None)
+    db.commit()
+    return schemas.KioscoConfig(
+        dispositivo_id=dispositivo.id,
+        dispositivo_nombre=dispositivo.nombre,
+        empresa_nombre=empresa.nombre,
+        zona_horaria=empresa.zona_horaria or models.ZONA_HORARIA_DEFAULT,
+        hora_servidor=ahora,
+        obra=obra,
+        trabajadores=items,
+    )
 
 # =============================================================================
 # USUARIOS (admin gestiona usuarios de su empresa; solo superadmin crea superadmins)
@@ -642,7 +742,7 @@ def delete_usuario_admin(
 
 _SEGMENTOS_API = {
     "api", "docs", "redoc", "openapi.json", "login", "me", "empresas", "trabajadores",
-    "obras", "dispositivos", "marcajes", "usuarios_admin", "planillas",
+    "obras", "dispositivos", "marcajes", "usuarios_admin", "planillas", "kiosco",
 }
 
 @app.get("/", include_in_schema=False)

@@ -7,7 +7,7 @@ Documentación general del proyecto: `../DOCUMENTACION_COMPLETA_LABORLOG.md`.
 | Archivo | Contenido |
 |---|---|
 | `main.py` | Endpoints REST |
-| `marcajes.py` | Reglas anti-fraude al registrar marcajes: geocerca, secuencia entrada/salida (turnos de hasta 20 h), reloj del dispositivo |
+| `marcajes.py` | Reglas anti-fraude al registrar marcajes: geocerca, GPS falso, secuencia entrada/salida (turnos de hasta 20 h), reloj del dispositivo; lotes offline con corrección de reloj e idempotencia |
 | `auth.py` | JWT, roles (`superadmin`, `admin`, `supervisor`), tokens de dispositivo (`X-Device-Token`) |
 | `models.py` / `schemas.py` | SQLAlchemy / Pydantic |
 | `database.py` | Conexión (`DATABASE_URL`) |
@@ -39,3 +39,8 @@ Usan una BD SQLite temporal; no tocan Postgres.
 `POST /marcajes` acepta:
 - `Authorization: Bearer <jwt>` de un usuario con rol supervisor/admin/superadmin (app web), o
 - `X-Device-Token: <token>` de un dispositivo registrado (app móvil). El token se obtiene al crear el dispositivo (`POST /dispositivos`) o al rotarlo (`POST /dispositivos/{id}/token`) y solo se muestra una vez.
+
+## Modo kiosco / offline (Fase 1)
+- `GET /kiosco/config` (solo `X-Device-Token`): obra asignada, trabajadores activos con su último marcaje, zona horaria.
+- `POST /marcajes/lote`: cola del teléfono. Cada marcaje trae su `id` (UUID del teléfono) para no duplicar al reenviar; `enviado_en` permite corregir el reloj del teléfono. Responde el resultado por marcaje (`creado` / `duplicado` / `rechazado` + motivo).
+- Pruebas: `tests/test_offline.py`.
