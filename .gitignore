@@ -205,3 +205,7 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Modelo facial: se descarga con modelos/descargar_modelo.py (no va en git)
+modelos/*.onnx
+modelos/*.tmp

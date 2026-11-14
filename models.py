@@ -55,9 +55,18 @@ class Trabajador(Base):
     telefono = Column(String)
     codigo_empresa = Column(String)
     fecha_registro = Column(TIMESTAMP)
+    # Huella facial normalizada (float32 little-endian) del modelo indicado en embedding_modelo
     embedding = Column(LargeBinary)
+    embedding_modelo = Column(String)
     foto_registro_path = Column(String)
+    rostro_registrado_en = Column(TIMESTAMP)
+    # Cuándo autorizó el trabajador el uso de su rostro (requisito para registrarlo)
+    consentimiento_biometrico_en = Column(TIMESTAMP)
     activo = Column(Boolean, default=True)
+
+    @property
+    def rostro_registrado(self) -> bool:
+        return self.embedding is not None
 
 class UsuarioAdmin(Base):
     __tablename__ = "usuarios_admin"
@@ -89,3 +98,10 @@ class Marcaje(Base):
     precision_metros = Column(Float)
     # True si se capturó sin conexión y llegó después por POST /marcajes/lote
     capturado_offline = Column(Boolean, nullable=False, default=False)
+    # rostro (reconocido por la cámara) | manual (eligió su nombre / lo marcó un supervisor)
+    metodo = Column(String)
+    # Similitud facial calculada en el teléfono y la recalculada por el servidor
+    similitud = Column(Float)
+    similitud_servidor = Column(Float)
+    # Prueba de vida superada en el teléfono (p. ej. "parpadeo", "giro_izquierda")
+    prueba_vida = Column(String)

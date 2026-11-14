@@ -12,10 +12,11 @@ from fastapi import HTTPException
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from . import models, schemas
+from . import fotos, models, rostros, schemas
 from .auth import ActorMarcaje
 
 TIPOS_VALIDOS = ("entrada", "salida")
+METODOS_VALIDOS = ("rostro", "manual")
 
 # Un turno (incluido nocturno) dura como máximo esto; pasado este tiempo una ENTRADA
 # sin SALIDA se considera olvidada y se permite una nueva ENTRADA.
@@ -238,7 +239,7 @@ def registrar_marcaje(
         ts_local, razon = _corregir_hora_offline(
             ts_dispositivo, _hora_local(enviado_en, tz), ahora_local
         )
-    estado = ESTADO_CONFLICTO if razon else ESTADO_OK
+    razones = [razon] if razon else []
 
     # --- Secuencia entrada/salida (soporta turnos nocturnos) -----------------
     ultimo = (
@@ -280,8 +281,27 @@ def registrar_marcaje(
             ),
         )
 
+    # --- Reconocimiento facial ------------------------------------------------
+    metodo = (payload.metodo or "manual").strip().lower()
+    if metodo not in METODOS_VALIDOS:
+        raise HTTPException(status_code=422, detail="metodo debe ser 'rostro' o 'manual'")
+    foto = None
+    if payload.foto_jpeg_b64:
+        try:
+            foto = rostros.foto_de_base64(payload.foto_jpeg_b64)
+        except rostros.RostroInvalido as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+    similitud_servidor, razon_rostro = _verificar_rostro(metodo, foto, trabajador, actor)
+    if razon_rostro:
+        razones.append(razon_rostro)
+    estado = ESTADO_CONFLICTO if razones else ESTADO_OK
+    razon = "; ".join(razones) or None
+
+    marcaje_id = payload.id or uuid.uuid4()
+    foto_path = fotos.guardar(empresa_id, "marcajes", marcaje_id, foto, ts_local) if foto else None
+
     marcaje = models.Marcaje(
-        id=payload.id or uuid.uuid4(),
+        id=marcaje_id,
         empresa_id=empresa_id,
         trabajador_id=trabajador.id,
         obra_id=obra.id,
@@ -291,12 +311,16 @@ def registrar_marcaje(
         origen=dispositivo.id,
         lat=str(payload.lat).strip(),
         lng=str(payload.lng).strip(),
-        foto_path=payload.foto_path,
+        foto_path=foto_path,
         estado_sync=estado,
         razon_conflicto=razon,
         registrado_por=actor.usuario.id if actor.usuario else None,
         precision_metros=payload.precision_metros,
         capturado_offline=enviado_en is not None,
+        metodo=metodo,
+        similitud=payload.similitud if metodo == "rostro" else None,
+        similitud_servidor=similitud_servidor,
+        prueba_vida=payload.prueba_vida if metodo == "rostro" else None,
     )
     db.add(marcaje)
     if actor.dispositivo is not None:
@@ -306,12 +330,39 @@ def registrar_marcaje(
     except IntegrityError:
         # Otro envío con el mismo id llegó al mismo tiempo
         db.rollback()
+        fotos.borrar(foto_path)
         existente = marcaje_existente(db, payload.id, empresa_id)
         if existente is None:
             raise
         return existente
     db.refresh(marcaje)
     return marcaje
+
+
+def _verificar_rostro(metodo, foto, trabajador, actor):
+    """Devuelve (similitud calculada por el servidor, motivo de conflicto o None).
+
+    Nunca rechaza el marcaje: si algo no cuadra queda como conflicto para que el
+    supervisor lo revise con la foto."""
+    if metodo == "manual":
+        if actor.dispositivo is not None and trabajador.embedding is not None:
+            return None, "Marcado sin reconocimiento facial (el trabajador tiene rostro registrado)"
+        return None, None
+    # metodo == "rostro"
+    if foto is None:
+        return None, "Marcaje facial sin foto"
+    if trabajador.embedding is None:
+        return None, "El trabajador no tiene rostro registrado"
+    motor = rostros.embebedor()
+    if motor is None:
+        return None, None  # servidor sin modelo: se confía en el teléfono (queda en el log)
+    try:
+        sim = rostros.similitud(motor.huella(foto), rostros.de_bytes(trabajador.embedding))
+    except rostros.RostroInvalido as exc:
+        return None, f"Foto del marcaje ilegible: {exc}"
+    if sim < rostros.UMBRAL_SIMILITUD:
+        return sim, f"El rostro no coincide con {trabajador.nombre} (similitud {sim:.2f})"
+    return sim, None
 
 
 def registrar_lote(

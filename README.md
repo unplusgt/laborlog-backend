@@ -40,6 +40,12 @@ Usan una BD SQLite temporal; no tocan Postgres.
 - `Authorization: Bearer <jwt>` de un usuario con rol supervisor/admin/superadmin (app web), o
 - `X-Device-Token: <token>` de un dispositivo registrado (app móvil). El token se obtiene al crear el dispositivo (`POST /dispositivos`) o al rotarlo (`POST /dispositivos/{id}/token`) y solo se muestra una vez.
 
+## Reconocimiento facial (Fase 2)
+- `rostros.py`: huella facial con SFace (OpenCV). El modelo se descarga con `python laborlog_backend/modelos/descargar_modelo.py` (el Dockerfile lo hace solo). Sin modelo, el servidor acepta los marcajes faciales sin verificarlos (lo avisa en el log).
+- `fotos.py`: fotos en `FOTOS_DIR` (en Docker, volumen `fotos`). Son datos biométricos: respaldarlas y no exponerlas.
+- Endpoints: `PUT/DELETE /trabajadores/{id}/rostro`, `GET /trabajadores/{id}/rostro/foto`, `GET /marcajes/{id}/foto`.
+- Pruebas: `tests/test_rostros.py` (usa un modelo falso; `test_modelo_sface_real` corre si el modelo está descargado).
+
 ## Modo kiosco / offline (Fase 1)
 - `GET /kiosco/config` (solo `X-Device-Token`): obra asignada, trabajadores activos con su último marcaje, zona horaria.
 - `POST /marcajes/lote`: cola del teléfono. Cada marcaje trae su `id` (UUID del teléfono) para no duplicar al reenviar; `enviado_en` permite corregir el reloj del teléfono. Responde el resultado por marcaje (`creado` / `duplicado` / `rechazado` + motivo).

@@ -9,11 +9,12 @@ _tmpdir = tempfile.mkdtemp(prefix="laborlog_tests_")
 os.environ["DATABASE_URL"] = f"sqlite:///{os.path.join(_tmpdir, 'test.db')}"
 os.environ["SECRET_KEY"] = "clave-de-pruebas-" + "x" * 40
 os.environ["CORS_ORIGINS"] = "http://localhost:8080"
+os.environ["FOTOS_DIR"] = os.path.join(_tmpdir, "fotos")
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
-from laborlog_backend import auth, models  # noqa: E402
+from laborlog_backend import auth, models, rostros  # noqa: E402
 from laborlog_backend.database import Base, SessionLocal, engine  # noqa: E402
 from laborlog_backend.main import app  # noqa: E402
 
@@ -25,6 +26,23 @@ OBRA_LAT, OBRA_LNG = 14.538364, -90.478339
 
 def ahora_local() -> datetime:
     return datetime.now(TZ).replace(tzinfo=None)
+
+
+class EmbebedorFalso:
+    """Sustituye al modelo SFace en las pruebas: la "foto" es b'ÿØ' + nombre de
+    la persona, y cada persona tiene una huella fija distinta."""
+
+    def huella(self, jpeg: bytes):
+        import numpy as np
+        semilla = sum(jpeg[2:]) % (2**32)
+        return rostros.normalizar(np.random.RandomState(semilla).randn(128))
+
+
+@pytest.fixture(autouse=True)
+def _modelo_facial_falso():
+    rostros.fijar_embebedor(EmbebedorFalso())
+    yield
+    rostros.fijar_embebedor(EmbebedorFalso())
 
 
 @pytest.fixture()

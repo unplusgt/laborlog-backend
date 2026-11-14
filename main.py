@@ -7,14 +7,14 @@ from datetime import datetime, timezone
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from . import auth, models, schemas
-from .auth import ROLES_ADMIN, ROLES_VALIDOS, ROL_SUPERADMIN
+from . import auth, fotos, models, rostros, schemas
+from .auth import ROLES_ADMIN, ROLES_MARCAJE, ROLES_VALIDOS, ROL_SUPERADMIN
 from .database import get_db
 from .marcajes import VENTANA_TURNO, zona_horaria_empresa, registrar_lote, registrar_marcaje
 
@@ -322,6 +322,120 @@ def delete_trabajador(
     return {"detail": "Trabajador deleted successfully"}
 
 # =============================================================================
+# ROSTROS (registro: supervisor o admin; borrar: admin)
+# =============================================================================
+
+supervisor_o_admin = auth.require_role(ROLES_MARCAJE)
+
+# Dos trabajadores distintos no pueden tener caras tan parecidas (evita que alguien
+# registre su rostro en la ficha de otro para marcar por él)
+UMBRAL_DUPLICADO = 0.55
+
+@app.put("/trabajadores/{trabajador_id}/rostro", response_model=schemas.Trabajador)
+def registrar_rostro(
+    trabajador_id: uuid.UUID,
+    datos: schemas.RostroRegistro,
+    db: Session = Depends(get_db),
+    current_user: models.UsuarioAdmin = Depends(supervisor_o_admin),
+):
+    """Registra (o reemplaza) el rostro del trabajador. Requiere su autorización."""
+    empresa_id = _empresa_id_or_500(current_user)
+    trabajador = _get_o_404(db, models.Trabajador, trabajador_id, empresa_id, "Trabajador")
+    if not datos.consentimiento:
+        raise HTTPException(
+            status_code=422,
+            detail="Se requiere la autorización del trabajador para registrar su rostro",
+        )
+    if datos.modelo != rostros.MODELO:
+        raise HTTPException(status_code=422, detail=f"Modelo facial no soportado: {datos.modelo}")
+    try:
+        huella = rostros.de_base64(datos.huella_b64)
+        foto = rostros.foto_de_base64(datos.foto_jpeg_b64)
+        motor = rostros.embebedor()
+        if motor is not None:
+            sim = rostros.similitud(motor.huella(foto), huella)
+            if sim < rostros.UMBRAL_REGISTRO:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"La foto no corresponde a la huella enviada (similitud {sim:.2f}). Repite la captura.",
+                )
+    except rostros.RostroInvalido as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    otros = (
+        db.query(models.Trabajador)
+        .filter(models.Trabajador.empresa_id == empresa_id)
+        .filter(models.Trabajador.id != trabajador.id)
+        .filter(models.Trabajador.embedding.is_not(None))
+        .all()
+    )
+    for otro in otros:
+        if otro.embedding_modelo == rostros.MODELO:
+            sim = rostros.similitud(huella, rostros.de_bytes(otro.embedding))
+            if sim >= UMBRAL_DUPLICADO:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Este rostro se parece mucho al de {otro.nombre} (similitud {sim:.2f}). "
+                    "Verifica que sea la persona correcta.",
+                )
+
+    ahora = datetime.now()
+    anterior = trabajador.foto_registro_path
+    trabajador.foto_registro_path = fotos.guardar(empresa_id, "rostros", trabajador.id, foto, ahora)
+    if anterior and anterior != trabajador.foto_registro_path:
+        fotos.borrar(anterior)
+    trabajador.embedding = rostros.a_bytes(huella)
+    trabajador.embedding_modelo = rostros.MODELO
+    trabajador.rostro_registrado_en = ahora
+    trabajador.consentimiento_biometrico_en = ahora
+    db.commit()
+    db.refresh(trabajador)
+    logger.info("Rostro registrado trabajador=%s por=%s", trabajador.id, current_user.id)
+    return trabajador
+
+@app.delete("/trabajadores/{trabajador_id}/rostro", response_model=schemas.Trabajador)
+def borrar_rostro(
+    trabajador_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: models.UsuarioAdmin = Depends(solo_admin),
+):
+    """Elimina los datos biométricos del trabajador (huella y foto de referencia)."""
+    trabajador = _get_o_404(db, models.Trabajador, trabajador_id, _empresa_id_or_500(current_user), "Trabajador")
+    fotos.borrar(trabajador.foto_registro_path)
+    trabajador.embedding = None
+    trabajador.embedding_modelo = None
+    trabajador.foto_registro_path = None
+    trabajador.rostro_registrado_en = None
+    trabajador.consentimiento_biometrico_en = None
+    db.commit()
+    db.refresh(trabajador)
+    return trabajador
+
+def _respuesta_foto(ruta):
+    datos = fotos.leer(ruta) if ruta else None
+    if datos is None:
+        raise HTTPException(status_code=404, detail="Sin foto")
+    return Response(content=datos, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
+
+@app.get("/trabajadores/{trabajador_id}/rostro/foto")
+def foto_rostro(
+    trabajador_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: models.UsuarioAdmin = Depends(auth.get_current_user),
+):
+    trabajador = _get_o_404(db, models.Trabajador, trabajador_id, _empresa_id_or_500(current_user), "Trabajador")
+    return _respuesta_foto(trabajador.foto_registro_path)
+
+@app.get("/marcajes/{marcaje_id}/foto")
+def foto_marcaje(
+    marcaje_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: models.UsuarioAdmin = Depends(auth.get_current_user),
+):
+    marcaje = _get_o_404(db, models.Marcaje, marcaje_id, _empresa_id_or_500(current_user), "Marcaje")
+    return _respuesta_foto(marcaje.foto_path)
+
+# =============================================================================
 # OBRAS (lectura: cualquier usuario; escritura: admin)
 # =============================================================================
 
@@ -617,6 +731,10 @@ def get_kiosco_config(
             ultimo_tipo=(ultimo.tipo or "").lower() if ultimo else None,
             ultimo_marcaje=(
                 ultimo.timestamp_local.replace(tzinfo=tz).astimezone(timezone.utc) if ultimo else None
+            ),
+            huella_b64=(
+                rostros.a_base64(t.embedding)
+                if t.embedding is not None and t.embedding_modelo == rostros.MODELO else None
             ),
         ))
     dispositivo.last_sync = ahora.replace(tzinfo=None)

@@ -34,7 +34,6 @@ class TrabajadorBase(BaseModel):
     dni: Optional[str] = None
     telefono: Optional[str] = None
     codigo_empresa: Optional[str] = None
-    foto_registro_path: Optional[str] = None
     activo: Optional[bool] = True
 
 class TrabajadorCreate(TrabajadorBase):
@@ -43,8 +42,21 @@ class TrabajadorCreate(TrabajadorBase):
 class Trabajador(TrabajadorBase):
     id: uuid.UUID
     empresa_id: Optional[uuid.UUID] = None
+    # La huella facial nunca se expone aquí; solo si está registrada
+    rostro_registrado: bool = False
+    rostro_registrado_en: Optional[datetime] = None
 
     model_config = ConfigDict(from_attributes=True)
+
+class RostroRegistro(BaseModel):
+    """Registro del rostro de un trabajador, capturado con el teléfono."""
+    # 128 float32 little-endian en base64 (promedio de varias capturas)
+    huella_b64: str = Field(max_length=1000)
+    # Cara alineada en JPEG (base64), queda como foto de referencia
+    foto_jpeg_b64: str = Field(max_length=220_000)
+    # El trabajador autorizó el uso de su rostro para control de asistencia
+    consentimiento: bool
+    modelo: str
 
 # Obra
 class ObraBase(BaseModel):
@@ -121,10 +133,14 @@ class MarcajeCreate(BaseModel):
     origen: Optional[uuid.UUID] = None
     lat: Optional[str] = None
     lng: Optional[str] = None
-    foto_path: Optional[str] = None
     precision_metros: Optional[float] = Field(default=None, ge=0)
     # El teléfono la reporta si detecta una app de GPS falso (Android: isMocked)
     ubicacion_simulada: bool = False
+    # Reconocimiento facial (Fase 2)
+    metodo: Optional[str] = None             # rostro | manual
+    similitud: Optional[float] = Field(default=None, ge=-1, le=1)
+    prueba_vida: Optional[str] = Field(default=None, max_length=40)
+    foto_jpeg_b64: Optional[str] = Field(default=None, max_length=220_000)
     # estado_sync y razon_conflicto los decide el servidor; se ignoran si vienen del cliente
 
 class MarcajeResponse(BaseModel):
@@ -144,6 +160,10 @@ class MarcajeResponse(BaseModel):
     registrado_por: Optional[uuid.UUID] = None
     precision_metros: Optional[float] = None
     capturado_offline: bool = False
+    metodo: Optional[str] = None
+    similitud: Optional[float] = None
+    similitud_servidor: Optional[float] = None
+    prueba_vida: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -180,6 +200,8 @@ class KioscoTrabajador(BaseModel):
     # Último marcaje dentro de la ventana de turno (para proponer ENTRADA o SALIDA sin conexión)
     ultimo_tipo: Optional[str] = None
     ultimo_marcaje: Optional[datetime] = None  # UTC
+    # Huella facial (base64) para reconocer sin conexión; None si no tiene rostro registrado
+    huella_b64: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 
