@@ -1,4 +1,6 @@
-from sqlalchemy import Column, String, Integer, Boolean, TIMESTAMP, ForeignKey, LargeBinary, Float
+from sqlalchemy import (
+    Boolean, Column, Float, ForeignKey, Integer, LargeBinary, String, TIMESTAMP, UniqueConstraint,
+)
 from sqlalchemy.dialects.postgresql import UUID
 import uuid
 from .database import Base
@@ -13,6 +15,7 @@ class Empresa(Base):
     __tablename__ = "empresas"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     nombre = Column(String, nullable=False)
+    # Código corto que se escribe al iniciar sesión (p. ej. "constructora-abc")
     slug = Column(String, unique=True, nullable=False)
     activa = Column(Boolean, default=True)
     hora_extra_desde = Column(Integer, default=8)
@@ -54,6 +57,8 @@ class Trabajador(Base):
     dni = Column(String)
     telefono = Column(String)
     codigo_empresa = Column(String)
+    # Obra a la que está asignado (define qué supervisor lo ve y en qué kiosco aparece)
+    obra_id = Column(Integer, ForeignKey("obras.id"), nullable=True)
     fecha_registro = Column(TIMESTAMP)
     # Huella facial normalizada (float32 little-endian) del modelo indicado en embedding_modelo
     embedding = Column(LargeBinary)
@@ -69,13 +74,29 @@ class Trabajador(Base):
         return self.embedding is not None
 
 class UsuarioAdmin(Base):
+    """Usuario que inicia sesión: plataforma (dueño de LaborLog, sin empresa),
+    superadmin, jefe o supervisor (de una empresa)."""
     __tablename__ = "usuarios_admin"
+    __table_args__ = (
+        UniqueConstraint("empresa_id", "usuario", name="uq_usuarios_empresa_usuario"),
+        UniqueConstraint("empresa_id", "email", name="uq_usuarios_empresa_email"),
+    )
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     empresa_id = Column(UUID(as_uuid=True), ForeignKey("empresas.id"), index=True)
     nombre = Column(String, nullable=False)
-    email = Column(String, unique=True, nullable=False)
+    # Nombre de usuario (único dentro de la empresa); se puede entrar con él o con el email
+    usuario = Column(String, nullable=False)
+    email = Column(String, nullable=True)
     hash_password = Column(String, nullable=False)
     rol = Column(String)
+    activo = Column(Boolean, nullable=False, default=True)
+
+
+class SupervisorObra(Base):
+    """Obras asignadas a un supervisor (solo ve esas obras y sus trabajadores)."""
+    __tablename__ = "supervisor_obras"
+    usuario_id = Column(UUID(as_uuid=True), ForeignKey("usuarios_admin.id", ondelete="CASCADE"), primary_key=True)
+    obra_id = Column(Integer, ForeignKey("obras.id", ondelete="CASCADE"), primary_key=True)
 
 class Marcaje(Base):
     __tablename__ = "marcajes"

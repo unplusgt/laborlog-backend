@@ -9,7 +9,8 @@ def test_login_y_me(client, datos):
     assert r.status_code == 200
     body = r.json()
     assert body["user"] == "admin@test.com"
-    assert body["rol"] == "admin"
+    assert body["rol"] == "jefe"
+    assert body["empresa_codigo"] == "test"
     assert body["nombre"] == "admin"
 
 
@@ -40,7 +41,7 @@ def test_admin_crea_supervisor_con_password_en_claro(client, datos):
     headers = headers_de(client, "admin@test.com")
     r = client.post(
         "/usuarios_admin/",
-        json={"nombre": "Nuevo", "email": "Nuevo@Test.com", "password": PASSWORD, "rol": "supervisor"},
+        json={"nombre": "Nuevo", "usuario": "nuevo", "email": "Nuevo@Test.com", "password": PASSWORD, "rol": "supervisor"},
         headers=headers,
     )
     assert r.status_code == 200, r.text
@@ -54,7 +55,7 @@ def test_admin_no_puede_crear_superadmin(client, datos):
     headers = headers_de(client, "admin@test.com")
     r = client.post(
         "/usuarios_admin/",
-        json={"nombre": "X", "email": "x@test.com", "password": PASSWORD, "rol": "superadmin"},
+        json={"nombre": "X", "usuario": "equis", "email": "x@test.com", "password": PASSWORD, "rol": "superadmin"},
         headers=headers,
     )
     assert r.status_code == 403
@@ -64,7 +65,7 @@ def test_superadmin_puede_crear_superadmin(client, datos):
     headers = headers_de(client, "root@test.com")
     r = client.post(
         "/usuarios_admin/",
-        json={"nombre": "X", "email": "x@test.com", "password": PASSWORD, "rol": "superadmin"},
+        json={"nombre": "X", "usuario": "equis", "email": "x@test.com", "password": PASSWORD, "rol": "superadmin"},
         headers=headers,
     )
     assert r.status_code == 200, r.text
@@ -74,7 +75,7 @@ def test_rol_invalido(client, datos):
     headers = headers_de(client, "admin@test.com")
     r = client.post(
         "/usuarios_admin/",
-        json={"nombre": "X", "email": "x@test.com", "password": PASSWORD, "rol": "jefe"},
+        json={"nombre": "X", "usuario": "equis", "email": "x@test.com", "password": PASSWORD, "rol": "gerente"},
         headers=headers,
     )
     assert r.status_code == 422
@@ -84,7 +85,7 @@ def test_email_duplicado(client, datos):
     headers = headers_de(client, "admin@test.com")
     r = client.post(
         "/usuarios_admin/",
-        json={"nombre": "X", "email": "super@test.com", "password": PASSWORD, "rol": "supervisor"},
+        json={"nombre": "X", "usuario": "equis", "email": "super@test.com", "password": PASSWORD, "rol": "supervisor"},
         headers=headers,
     )
     assert r.status_code == 409

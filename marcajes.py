@@ -12,7 +12,7 @@ from fastapi import HTTPException
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from . import fotos, models, rostros, schemas
+from . import alcance, fotos, models, rostros, schemas
 from .auth import ActorMarcaje
 
 TIPOS_VALIDOS = ("entrada", "salida")
@@ -201,9 +201,10 @@ def registrar_marcaje(
 
     if actor.dispositivo is not None:
         dispositivo = actor.dispositivo
+    elif payload.origen is None:
+        # Marcaje de un usuario (supervisor/jefe) sin teléfono kiosco: queda registrado_por
+        dispositivo = None
     else:
-        if payload.origen is None:
-            raise HTTPException(status_code=422, detail="Falta el dispositivo de origen")
         dispositivo = (
             db.query(models.Dispositivo)
             .filter(models.Dispositivo.id == payload.origen)
@@ -214,6 +215,12 @@ def registrar_marcaje(
             raise HTTPException(status_code=404, detail="Dispositivo no encontrado")
         if dispositivo.activo is False:
             raise HTTPException(status_code=403, detail="Dispositivo desactivado")
+
+    if actor.usuario is not None and alcance.es_supervisor(actor.usuario):
+        if not alcance.puede_ver_obra(db, actor.usuario, obra.id) or not alcance.puede_ver_trabajador(
+            db, actor.usuario, trabajador
+        ):
+            raise HTTPException(status_code=403, detail="Solo puedes marcar en tus obras y a sus trabajadores")
 
     if actor.dispositivo is not None and actor.dispositivo.obra_id is not None:
         if obra.id != actor.dispositivo.obra_id:
@@ -240,6 +247,8 @@ def registrar_marcaje(
             ts_dispositivo, _hora_local(enviado_en, tz), ahora_local
         )
     razones = [razon] if razon else []
+    if trabajador.obra_id is not None and trabajador.obra_id != obra.id:
+        razones.append("El trabajador está asignado a otra obra")
 
     # --- Secuencia entrada/salida (soporta turnos nocturnos) -----------------
     ultimo = (
@@ -308,7 +317,7 @@ def registrar_marcaje(
         tipo=tipo,
         timestamp_server=ahora_utc.replace(tzinfo=None),  # UTC
         timestamp_local=ts_local,
-        origen=dispositivo.id,
+        origen=dispositivo.id if dispositivo is not None else None,
         lat=str(payload.lat).strip(),
         lng=str(payload.lng).strip(),
         foto_path=foto_path,

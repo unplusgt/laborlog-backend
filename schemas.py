@@ -35,6 +35,8 @@ class TrabajadorBase(BaseModel):
     telefono: Optional[str] = None
     codigo_empresa: Optional[str] = None
     activo: Optional[bool] = True
+    # Obra asignada (la ve el supervisor de esa obra y aparece en su kiosco)
+    obra_id: Optional[int] = None
 
 class TrabajadorCreate(TrabajadorBase):
     pass
@@ -100,26 +102,71 @@ class DispositivoConToken(Dispositivo):
     """Respuesta al crear o rotar el token: es la ÚNICA vez que se ve el token en claro."""
     token: str
 
-# UsuarioAdmin (nunca se expone hash_password)
-class UsuarioAdminBase(BaseModel):
-    nombre: str
-    email: str
-    rol: Optional[str] = None
+# Usuarios (nunca se expone hash_password)
+PATRON_USUARIO = r"^[a-z0-9][a-z0-9._-]{2,39}$"
+PATRON_CODIGO_EMPRESA = r"^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$"
 
-class UsuarioAdminCreate(UsuarioAdminBase):
+class UsuarioAdminCreate(BaseModel):
+    nombre: str = Field(min_length=1)
+    # Para iniciar sesión: minúsculas, números, punto, guion o guion bajo
+    usuario: str = Field(pattern=PATRON_USUARIO)
+    email: Optional[str] = None
+    rol: str
     password: str = Field(min_length=8)
+    # Solo supervisores: obras que puede ver
+    obras: list[int] = []
 
 class UsuarioAdminUpdate(BaseModel):
     nombre: Optional[str] = None
+    usuario: Optional[str] = Field(default=None, pattern=PATRON_USUARIO)
     email: Optional[str] = None
     rol: Optional[str] = None
     password: Optional[str] = Field(default=None, min_length=8)
+    activo: Optional[bool] = None
+    obras: Optional[list[int]] = None
 
-class UsuarioAdmin(UsuarioAdminBase):
+class UsuarioAdmin(BaseModel):
     id: uuid.UUID
     empresa_id: Optional[uuid.UUID] = None
+    nombre: str
+    usuario: str
+    email: Optional[str] = None
+    rol: Optional[str] = None
+    activo: bool = True
+    obras: list[int] = []
 
     model_config = ConfigDict(from_attributes=True)
+
+
+# Plataforma (dueño de LaborLog): alta y administración de empresas
+class PrimerUsuario(BaseModel):
+    nombre: str = Field(min_length=1)
+    usuario: str = Field(pattern=PATRON_USUARIO)
+    email: Optional[str] = None
+    password: str = Field(min_length=8)
+
+class EmpresaNueva(BaseModel):
+    nombre: str = Field(min_length=1)
+    codigo: str = Field(pattern=PATRON_CODIGO_EMPRESA)
+    zona_horaria: str = "America/Guatemala"
+    superadmin: PrimerUsuario
+
+class EmpresaPlataformaUpdate(BaseModel):
+    nombre: Optional[str] = None
+    codigo: Optional[str] = Field(default=None, pattern=PATRON_CODIGO_EMPRESA)
+    activa: Optional[bool] = None
+
+class EmpresaPlataforma(BaseModel):
+    id: uuid.UUID
+    nombre: str
+    codigo: str
+    activa: bool
+    zona_horaria: str
+    created_at: Optional[datetime] = None
+    usuarios: int = 0
+    trabajadores: int = 0
+    obras: int = 0
+    dispositivos: int = 0
 
 # Marcaje
 class MarcajeCreate(BaseModel):
@@ -218,6 +265,8 @@ class KioscoConfig(BaseModel):
     dispositivo_id: uuid.UUID
     dispositivo_nombre: Optional[str] = None
     empresa_nombre: str
+    # Para pedir usuario de supervisor en el kiosco sin escribir la empresa
+    empresa_codigo: Optional[str] = None
     zona_horaria: str
     hora_servidor: datetime
     obra: Optional[KioscoObra] = None

@@ -89,7 +89,7 @@ def test_registro_foto_que_no_corresponde_a_la_huella(client, datos):
 
 
 def test_registro_rechaza_rostro_de_otro_trabajador(client, datos, db):
-    otro = models.Trabajador(id=uuid.uuid4(), nombre="Pedro", activo=True, empresa_id=datos["empresa"].id)
+    otro = models.Trabajador(id=uuid.uuid4(), nombre="Pedro", activo=True, empresa_id=datos["empresa"].id, obra_id=1)
     db.add(otro)
     db.commit()
     assert _registrar(client, datos, persona="juan").status_code == 200

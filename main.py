@@ -4,17 +4,20 @@ import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
 
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import Depends, FastAPI, Form, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
-from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from . import auth, fotos, models, rostros, schemas
-from .auth import ROLES_ADMIN, ROLES_MARCAJE, ROLES_VALIDOS, ROL_SUPERADMIN
+from . import alcance, auth, fotos, models, rostros, schemas
+from .auth import (
+    CODIGO_PLATAFORMA, ROLES_EMPRESA, ROLES_GESTION, ROLES_MARCAJE, ROLES_PLANILLA,
+    ROL_JEFE, ROL_PLATAFORMA, ROL_SUPERADMIN, ROL_SUPERVISOR,
+)
 from .database import get_db
 from .marcajes import VENTANA_TURNO, zona_horaria_empresa, registrar_lote, registrar_marcaje
 
@@ -101,13 +104,24 @@ async def generic_exception_handler(request: Request, exc: Exception):
 
 
 # --- Helpers ------------------------------------------------------------------
-solo_admin = auth.require_role(ROLES_ADMIN)
+# superadmin y jefe: catálogos, trabajadores, dispositivos, supervisores
+gestion = auth.require_role(ROLES_GESTION)
+# solo superadmin: planilla y configuración de pago
+solo_superadmin = auth.require_role(ROLES_PLANILLA)
+# cualquier usuario de una empresa (no el usuario de plataforma)
+usuario_empresa = auth.require_role(ROLES_EMPRESA)
+solo_plataforma = auth.require_role({ROL_PLATAFORMA})
 
 
 def _empresa_id_or_500(current_user: models.UsuarioAdmin):
     if not current_user.empresa_id:
-        raise HTTPException(status_code=500, detail="Usuario sin empresa asignada")
+        raise HTTPException(status_code=403, detail="Usuario sin empresa asignada")
     return current_user.empresa_id
+
+
+def _validar_obra_empresa(db: Session, obra_id, empresa_id):
+    if obra_id is not None:
+        _get_o_404(db, models.Obra, obra_id, empresa_id, "Obra")
 
 
 def _get_o_404(db: Session, modelo, entity_id, empresa_id, nombre: str):
@@ -198,12 +212,22 @@ def _build_planilla_resumen(db: Session, empresa_id, fecha_inicio: datetime, fec
 # =============================================================================
 
 @app.post("/login")
-def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-    user = auth.authenticate_user(db, form_data.username, form_data.password)
+def login(
+    username: str = Form(...),
+    password: str = Form(...),
+    empresa: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    """Inicia sesión con código de empresa + usuario (o email) + contraseña.
+    El dueño de la plataforma usa el código de empresa "plataforma".
+    (En /docs, si no hay campo empresa, se acepta username "empresa/usuario".)"""
+    if not empresa and "/" in username:
+        empresa, username = username.split("/", 1)
+    user = auth.authenticate_user(db, empresa, username, password)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect email or password",
+            detail="Empresa, usuario o contraseña incorrectos",
             headers={"WWW-Authenticate": "Bearer"},
         )
     access_token = auth.create_access_token(data={"sub": str(user.id)})
@@ -211,20 +235,32 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
 
 
 @app.get("/me")
-def read_users_me(current_user: models.UsuarioAdmin = Depends(auth.get_current_user)):
+def read_users_me(
+    db: Session = Depends(get_db),
+    current_user: models.UsuarioAdmin = Depends(auth.get_current_user),
+):
+    empresa = None
+    if current_user.empresa_id:
+        empresa = db.query(models.Empresa).filter(models.Empresa.id == current_user.empresa_id).first()
     return {
-        "user": current_user.email,
+        "user": current_user.email or current_user.usuario,
         "id": str(current_user.id),
         "nombre": current_user.nombre,
+        "usuario": current_user.usuario,
+        "email": current_user.email,
         "rol": auth.rol_de(current_user),
         "empresa_id": str(current_user.empresa_id) if current_user.empresa_id else None,
+        "empresa_codigo": empresa.slug if empresa else None,
+        "empresa_nombre": empresa.nombre if empresa else None,
+        # Supervisor: obras que puede ver (None = todas)
+        "obras": alcance.obras_visibles(db, current_user),
     }
 
 
 @app.get("/empresas/me", response_model=schemas.Empresa)
 def get_empresa_actual(
     db: Session = Depends(get_db),
-    current_user: models.UsuarioAdmin = Depends(auth.get_current_user),
+    current_user: models.UsuarioAdmin = Depends(usuario_empresa),
 ):
     empresa_id = _empresa_id_or_500(current_user)
     empresa = db.query(models.Empresa).filter(models.Empresa.id == empresa_id).first()
@@ -237,7 +273,7 @@ def get_empresa_actual(
 def update_empresa_config(
     payload: schemas.EmpresaConfigUpdate,
     db: Session = Depends(get_db),
-    current_user: models.UsuarioAdmin = Depends(solo_admin),
+    current_user: models.UsuarioAdmin = Depends(solo_superadmin),
 ):
     empresa_id = _empresa_id_or_500(current_user)
     empresa = db.query(models.Empresa).filter(models.Empresa.id == empresa_id).first()
@@ -267,28 +303,33 @@ def update_empresa_config(
 @app.get("/trabajadores/", response_model=list[schemas.Trabajador], include_in_schema=False)
 def get_trabajadores(
     db: Session = Depends(get_db),
-    current_user: models.UsuarioAdmin = Depends(auth.get_current_user)
+    current_user: models.UsuarioAdmin = Depends(usuario_empresa)
 ):
-    return db.query(models.Trabajador).filter(models.Trabajador.empresa_id == _empresa_id_or_500(current_user)).all()
+    q = db.query(models.Trabajador).filter(models.Trabajador.empresa_id == _empresa_id_or_500(current_user))
+    return alcance.filtrar_trabajadores(q, db, current_user).order_by(models.Trabajador.nombre).all()
 
 @app.get("/trabajadores/{trabajador_id}", response_model=schemas.Trabajador)
 def get_trabajador(
     trabajador_id: uuid.UUID,
     db: Session = Depends(get_db),
-    current_user: models.UsuarioAdmin = Depends(auth.get_current_user)
+    current_user: models.UsuarioAdmin = Depends(usuario_empresa)
 ):
-    return _get_o_404(db, models.Trabajador, trabajador_id, _empresa_id_or_500(current_user), "Trabajador")
+    t = _get_o_404(db, models.Trabajador, trabajador_id, _empresa_id_or_500(current_user), "Trabajador")
+    alcance.exigir_trabajador(db, current_user, t)
+    return t
 
 @app.post("/trabajadores", response_model=schemas.Trabajador)
 @app.post("/trabajadores/", response_model=schemas.Trabajador, include_in_schema=False)
 def create_trabajador(
     trabajador: schemas.TrabajadorCreate,
     db: Session = Depends(get_db),
-    current_user: models.UsuarioAdmin = Depends(solo_admin)
+    current_user: models.UsuarioAdmin = Depends(gestion)
 ):
+    empresa_id = _empresa_id_or_500(current_user)
+    _validar_obra_empresa(db, trabajador.obra_id, empresa_id)
     db_trabajador = models.Trabajador(
         **trabajador.model_dump(),
-        empresa_id=_empresa_id_or_500(current_user),
+        empresa_id=empresa_id,
         fecha_registro=datetime.now(),
     )
     db.add(db_trabajador)
@@ -301,10 +342,14 @@ def update_trabajador(
     trabajador_id: uuid.UUID,
     trabajador: schemas.TrabajadorCreate,
     db: Session = Depends(get_db),
-    current_user: models.UsuarioAdmin = Depends(solo_admin)
+    current_user: models.UsuarioAdmin = Depends(gestion)
 ):
-    db_trabajador = _get_o_404(db, models.Trabajador, trabajador_id, _empresa_id_or_500(current_user), "Trabajador")
-    for field, value in trabajador.model_dump(exclude_unset=True).items():
+    empresa_id = _empresa_id_or_500(current_user)
+    db_trabajador = _get_o_404(db, models.Trabajador, trabajador_id, empresa_id, "Trabajador")
+    cambios = trabajador.model_dump(exclude_unset=True)
+    if "obra_id" in cambios:
+        _validar_obra_empresa(db, cambios["obra_id"], empresa_id)
+    for field, value in cambios.items():
         setattr(db_trabajador, field, value)
     db.commit()
     db.refresh(db_trabajador)
@@ -314,7 +359,7 @@ def update_trabajador(
 def delete_trabajador(
     trabajador_id: uuid.UUID,
     db: Session = Depends(get_db),
-    current_user: models.UsuarioAdmin = Depends(solo_admin)
+    current_user: models.UsuarioAdmin = Depends(gestion)
 ):
     db_trabajador = _get_o_404(db, models.Trabajador, trabajador_id, _empresa_id_or_500(current_user), "Trabajador")
     db.delete(db_trabajador)
@@ -341,6 +386,7 @@ def registrar_rostro(
     """Registra (o reemplaza) el rostro del trabajador. Requiere su autorización."""
     empresa_id = _empresa_id_or_500(current_user)
     trabajador = _get_o_404(db, models.Trabajador, trabajador_id, empresa_id, "Trabajador")
+    alcance.exigir_trabajador(db, current_user, trabajador)
     if not datos.consentimiento:
         raise HTTPException(
             status_code=422,
@@ -397,7 +443,7 @@ def registrar_rostro(
 def borrar_rostro(
     trabajador_id: uuid.UUID,
     db: Session = Depends(get_db),
-    current_user: models.UsuarioAdmin = Depends(solo_admin),
+    current_user: models.UsuarioAdmin = Depends(gestion),
 ):
     """Elimina los datos biométricos del trabajador (huella y foto de referencia)."""
     trabajador = _get_o_404(db, models.Trabajador, trabajador_id, _empresa_id_or_500(current_user), "Trabajador")
@@ -421,18 +467,20 @@ def _respuesta_foto(ruta):
 def foto_rostro(
     trabajador_id: uuid.UUID,
     db: Session = Depends(get_db),
-    current_user: models.UsuarioAdmin = Depends(auth.get_current_user),
+    current_user: models.UsuarioAdmin = Depends(usuario_empresa),
 ):
     trabajador = _get_o_404(db, models.Trabajador, trabajador_id, _empresa_id_or_500(current_user), "Trabajador")
+    alcance.exigir_trabajador(db, current_user, trabajador)
     return _respuesta_foto(trabajador.foto_registro_path)
 
 @app.get("/marcajes/{marcaje_id}/foto")
 def foto_marcaje(
     marcaje_id: uuid.UUID,
     db: Session = Depends(get_db),
-    current_user: models.UsuarioAdmin = Depends(auth.get_current_user),
+    current_user: models.UsuarioAdmin = Depends(usuario_empresa),
 ):
     marcaje = _get_o_404(db, models.Marcaje, marcaje_id, _empresa_id_or_500(current_user), "Marcaje")
+    alcance.exigir_obra(db, current_user, marcaje.obra_id)
     return _respuesta_foto(marcaje.foto_path)
 
 # =============================================================================
@@ -443,24 +491,27 @@ def foto_marcaje(
 @app.get("/obras/", response_model=list[schemas.Obra], include_in_schema=False)
 def get_obras(
     db: Session = Depends(get_db),
-    current_user: models.UsuarioAdmin = Depends(auth.get_current_user)
+    current_user: models.UsuarioAdmin = Depends(usuario_empresa)
 ):
-    return db.query(models.Obra).filter(models.Obra.empresa_id == _empresa_id_or_500(current_user)).all()
+    q = db.query(models.Obra).filter(models.Obra.empresa_id == _empresa_id_or_500(current_user))
+    return alcance.filtrar_obras(q, db, current_user).order_by(models.Obra.nombre).all()
 
 @app.get("/obras/{obra_id}", response_model=schemas.Obra)
 def get_obra(
     obra_id: int,
     db: Session = Depends(get_db),
-    current_user: models.UsuarioAdmin = Depends(auth.get_current_user)
+    current_user: models.UsuarioAdmin = Depends(usuario_empresa)
 ):
-    return _get_o_404(db, models.Obra, obra_id, _empresa_id_or_500(current_user), "Obra")
+    obra = _get_o_404(db, models.Obra, obra_id, _empresa_id_or_500(current_user), "Obra")
+    alcance.exigir_obra(db, current_user, obra.id)
+    return obra
 
 @app.post("/obras", response_model=schemas.Obra)
 @app.post("/obras/", response_model=schemas.Obra, include_in_schema=False)
 def create_obra(
     obra: schemas.ObraCreate,
     db: Session = Depends(get_db),
-    current_user: models.UsuarioAdmin = Depends(solo_admin)
+    current_user: models.UsuarioAdmin = Depends(gestion)
 ):
     db_obra = models.Obra(**obra.model_dump(), empresa_id=_empresa_id_or_500(current_user))
     db.add(db_obra)
@@ -473,7 +524,7 @@ def update_obra(
     obra_id: int,
     obra: schemas.ObraCreate,
     db: Session = Depends(get_db),
-    current_user: models.UsuarioAdmin = Depends(solo_admin)
+    current_user: models.UsuarioAdmin = Depends(gestion)
 ):
     db_obra = _get_o_404(db, models.Obra, obra_id, _empresa_id_or_500(current_user), "Obra")
     for field, value in obra.model_dump(exclude_unset=True).items():
@@ -486,7 +537,7 @@ def update_obra(
 def delete_obra(
     obra_id: int,
     db: Session = Depends(get_db),
-    current_user: models.UsuarioAdmin = Depends(solo_admin)
+    current_user: models.UsuarioAdmin = Depends(gestion)
 ):
     db_obra = _get_o_404(db, models.Obra, obra_id, _empresa_id_or_500(current_user), "Obra")
     db.delete(db_obra)
@@ -544,36 +595,36 @@ def create_marcajes_lote(
 @app.get("/marcajes/", response_model=list[schemas.Marcaje], include_in_schema=False)
 def read_marcajes(
     db: Session = Depends(get_db),
-    current_user: models.UsuarioAdmin = Depends(auth.get_current_user)
+    current_user: models.UsuarioAdmin = Depends(usuario_empresa)
 ):
-    return (
-        db.query(models.Marcaje)
-        .filter(models.Marcaje.empresa_id == _empresa_id_or_500(current_user))
-        .order_by(models.Marcaje.timestamp_local.desc())
-        .all()
-    )
+    q = db.query(models.Marcaje).filter(models.Marcaje.empresa_id == _empresa_id_or_500(current_user))
+    return alcance.filtrar_marcajes(q, db, current_user).order_by(models.Marcaje.timestamp_local.desc()).all()
 
 @app.get("/marcajes/{marcaje_id}", response_model=schemas.Marcaje)
 def get_marcaje(
     marcaje_id: uuid.UUID,
     db: Session = Depends(get_db),
-    current_user: models.UsuarioAdmin = Depends(auth.get_current_user)
+    current_user: models.UsuarioAdmin = Depends(usuario_empresa)
 ):
-    return _get_o_404(db, models.Marcaje, marcaje_id, _empresa_id_or_500(current_user), "Marcaje")
+    marcaje = _get_o_404(db, models.Marcaje, marcaje_id, _empresa_id_or_500(current_user), "Marcaje")
+    alcance.exigir_obra(db, current_user, marcaje.obra_id)
+    return marcaje
 
 @app.get("/trabajadores/{trabajador_id}/marcajes", response_model=list[schemas.Marcaje])
 def get_marcajes_trabajador(
     trabajador_id: uuid.UUID,
     db: Session = Depends(get_db),
-    current_user: models.UsuarioAdmin = Depends(auth.get_current_user)
+    current_user: models.UsuarioAdmin = Depends(usuario_empresa)
 ):
-    return (
+    empresa_id = _empresa_id_or_500(current_user)
+    trabajador = _get_o_404(db, models.Trabajador, trabajador_id, empresa_id, "Trabajador")
+    alcance.exigir_trabajador(db, current_user, trabajador)
+    q = (
         db.query(models.Marcaje)
         .filter(models.Marcaje.trabajador_id == trabajador_id)
-        .filter(models.Marcaje.empresa_id == _empresa_id_or_500(current_user))
-        .order_by(models.Marcaje.timestamp_local.desc())
-        .all()
+        .filter(models.Marcaje.empresa_id == empresa_id)
     )
+    return alcance.filtrar_marcajes(q, db, current_user).order_by(models.Marcaje.timestamp_local.desc()).all()
 
 
 @app.get("/planillas/resumen", response_model=schemas.PlanillaResumenResponse)
@@ -581,7 +632,7 @@ def planilla_resumen(
     fecha_inicio: datetime,
     fecha_fin: datetime,
     db: Session = Depends(get_db),
-    current_user: models.UsuarioAdmin = Depends(solo_admin),
+    current_user: models.UsuarioAdmin = Depends(solo_superadmin),
 ):
     if fecha_fin < fecha_inicio:
         raise HTTPException(status_code=400, detail="Rango de fechas inválido")
@@ -595,7 +646,7 @@ def planilla_resumen(
 @app.get("/dispositivos/", response_model=list[schemas.Dispositivo], include_in_schema=False)
 def get_dispositivos(
     db: Session = Depends(get_db),
-    current_user: models.UsuarioAdmin = Depends(auth.get_current_user)
+    current_user: models.UsuarioAdmin = Depends(gestion)
 ):
     return db.query(models.Dispositivo).filter(models.Dispositivo.empresa_id == _empresa_id_or_500(current_user)).all()
 
@@ -603,13 +654,12 @@ def get_dispositivos(
 def get_dispositivo(
     dispositivo_id: uuid.UUID,
     db: Session = Depends(get_db),
-    current_user: models.UsuarioAdmin = Depends(auth.get_current_user)
+    current_user: models.UsuarioAdmin = Depends(gestion)
 ):
     return _get_o_404(db, models.Dispositivo, dispositivo_id, _empresa_id_or_500(current_user), "Dispositivo")
 
 def _validar_obra_dispositivo(db: Session, obra_id, empresa_id):
-    if obra_id is not None:
-        _get_o_404(db, models.Obra, obra_id, empresa_id, "Obra")
+    _validar_obra_empresa(db, obra_id, empresa_id)
 
 def _respuesta_con_token(dispositivo: models.Dispositivo, token: str) -> schemas.DispositivoConToken:
     base = schemas.Dispositivo.model_validate(dispositivo).model_dump()
@@ -620,7 +670,7 @@ def _respuesta_con_token(dispositivo: models.Dispositivo, token: str) -> schemas
 def create_dispositivo(
     dispositivo: schemas.DispositivoCreate,
     db: Session = Depends(get_db),
-    current_user: models.UsuarioAdmin = Depends(solo_admin)
+    current_user: models.UsuarioAdmin = Depends(gestion)
 ):
     """Registra un dispositivo y devuelve su token. El token solo se muestra esta vez:
     configúralo en el teléfono (header X-Device-Token)."""
@@ -642,7 +692,7 @@ def create_dispositivo(
 def rotar_token_dispositivo(
     dispositivo_id: uuid.UUID,
     db: Session = Depends(get_db),
-    current_user: models.UsuarioAdmin = Depends(solo_admin)
+    current_user: models.UsuarioAdmin = Depends(gestion)
 ):
     """Genera un token nuevo para el dispositivo (el anterior deja de funcionar)."""
     db_dispositivo = _get_o_404(db, models.Dispositivo, dispositivo_id, _empresa_id_or_500(current_user), "Dispositivo")
@@ -657,7 +707,7 @@ def update_dispositivo(
     dispositivo_id: uuid.UUID,
     dispositivo: schemas.DispositivoUpdate,
     db: Session = Depends(get_db),
-    current_user: models.UsuarioAdmin = Depends(solo_admin)
+    current_user: models.UsuarioAdmin = Depends(gestion)
 ):
     empresa_id = _empresa_id_or_500(current_user)
     db_dispositivo = _get_o_404(db, models.Dispositivo, dispositivo_id, empresa_id, "Dispositivo")
@@ -674,7 +724,7 @@ def update_dispositivo(
 def delete_dispositivo(
     dispositivo_id: uuid.UUID,
     db: Session = Depends(get_db),
-    current_user: models.UsuarioAdmin = Depends(solo_admin)
+    current_user: models.UsuarioAdmin = Depends(gestion)
 ):
     db_dispositivo = _get_o_404(db, models.Dispositivo, dispositivo_id, _empresa_id_or_500(current_user), "Dispositivo")
     db.delete(db_dispositivo)
@@ -703,13 +753,15 @@ def get_kiosco_config(
             .filter(models.Obra.empresa_id == empresa.id)
             .first()
         )
-    trabajadores = (
+    q_trab = (
         db.query(models.Trabajador)
         .filter(models.Trabajador.empresa_id == empresa.id)
         .filter(models.Trabajador.activo.is_not(False))
-        .order_by(models.Trabajador.nombre)
-        .all()
     )
+    if obra is not None:
+        # Solo los trabajadores de esta obra (y los que aún no tienen obra asignada)
+        q_trab = q_trab.filter(or_(models.Trabajador.obra_id == obra.id, models.Trabajador.obra_id.is_(None)))
+    trabajadores = q_trab.order_by(models.Trabajador.nombre).all()
     ahora = datetime.now(timezone.utc)
     tz = zona_horaria_empresa(empresa)
     desde = ahora.astimezone(tz).replace(tzinfo=None) - VENTANA_TURNO
@@ -743,6 +795,7 @@ def get_kiosco_config(
         dispositivo_id=dispositivo.id,
         dispositivo_nombre=dispositivo.nombre,
         empresa_nombre=empresa.nombre,
+        empresa_codigo=empresa.slug,
         zona_horaria=empresa.zona_horaria or models.ZONA_HORARIA_DEFAULT,
         hora_servidor=ahora,
         obra=obra,
@@ -753,106 +806,240 @@ def get_kiosco_config(
 # USUARIOS (admin gestiona usuarios de su empresa; solo superadmin crea superadmins)
 # =============================================================================
 
+def _respuesta_usuario(db: Session, u: models.UsuarioAdmin) -> schemas.UsuarioAdmin:
+    base = schemas.UsuarioAdmin.model_validate(u)
+    base.rol = auth.rol_de(u)
+    base.obras = alcance.obras_asignadas(db, u) if auth.rol_de(u) == ROL_SUPERVISOR else []
+    return base
+
+def _roles_que_asigna(current_user: models.UsuarioAdmin) -> set[str]:
+    """superadmin crea cualquier rol de su empresa; jefe solo supervisores."""
+    return ROLES_EMPRESA if auth.rol_de(current_user) == ROL_SUPERADMIN else {ROL_SUPERVISOR}
+
 def _validar_rol_asignable(rol: str | None, current_user: models.UsuarioAdmin) -> str:
     rol = (rol or "").strip().lower()
-    if rol not in ROLES_VALIDOS:
-        raise HTTPException(status_code=422, detail=f"Rol inválido. Opciones: {sorted(ROLES_VALIDOS)}")
-    if rol == ROL_SUPERADMIN and auth.rol_de(current_user) != ROL_SUPERADMIN:
-        raise HTTPException(status_code=403, detail="Solo un superadmin puede asignar el rol superadmin")
+    if rol not in ROLES_EMPRESA:
+        raise HTTPException(status_code=422, detail=f"Rol inválido. Opciones: {sorted(ROLES_EMPRESA)}")
+    if rol not in _roles_que_asigna(current_user):
+        raise HTTPException(status_code=403, detail=f"Tu rol no puede asignar el rol {rol}")
     return rol
 
-def _email_libre(db: Session, email: str, excepto_id=None):
-    q = db.query(models.UsuarioAdmin).filter(models.UsuarioAdmin.email == email)
-    if excepto_id is not None:
-        q = q.filter(models.UsuarioAdmin.id != excepto_id)
-    if q.first():
+def _exigir_puede_gestionar(current_user: models.UsuarioAdmin, objetivo: models.UsuarioAdmin):
+    if auth.rol_de(objetivo) not in _roles_que_asigna(current_user):
+        raise HTTPException(status_code=403, detail="No puedes modificar a un usuario con ese rol")
+
+def _identificadores_libres(db: Session, empresa_id, usuario: str | None, email: str | None, excepto_id=None):
+    def existe(columna, valor):
+        q = (
+            db.query(models.UsuarioAdmin)
+            .filter(models.UsuarioAdmin.empresa_id == empresa_id)
+            .filter(func.lower(columna) == valor)
+        )
+        if excepto_id is not None:
+            q = q.filter(models.UsuarioAdmin.id != excepto_id)
+        return q.first() is not None
+
+    if usuario and existe(models.UsuarioAdmin.usuario, usuario):
+        raise HTTPException(status_code=409, detail="Ya existe un usuario con ese nombre de usuario")
+    if email and existe(models.UsuarioAdmin.email, email):
         raise HTTPException(status_code=409, detail="Ya existe un usuario con ese email")
+
+def _normalizar_email(email: str | None) -> str | None:
+    email = (email or "").strip().lower()
+    return email or None
+
+def _asignar_obras(db: Session, usuario: models.UsuarioAdmin, obras: list[int], empresa_id):
+    db.query(models.SupervisorObra).filter(models.SupervisorObra.usuario_id == usuario.id).delete()
+    for obra_id in sorted(set(obras)):
+        _get_o_404(db, models.Obra, obra_id, empresa_id, "Obra")
+        db.add(models.SupervisorObra(usuario_id=usuario.id, obra_id=obra_id))
 
 @app.post("/usuarios_admin", response_model=schemas.UsuarioAdmin)
 @app.post("/usuarios_admin/", response_model=schemas.UsuarioAdmin, include_in_schema=False)
 def create_usuario_admin(
     usuario: schemas.UsuarioAdminCreate,
     db: Session = Depends(get_db),
-    current_user: models.UsuarioAdmin = Depends(solo_admin)
+    current_user: models.UsuarioAdmin = Depends(gestion)
 ):
+    empresa_id = _empresa_id_or_500(current_user)
     rol = _validar_rol_asignable(usuario.rol, current_user)
-    email = usuario.email.strip().lower()
-    _email_libre(db, email)
+    email = _normalizar_email(usuario.email)
+    _identificadores_libres(db, empresa_id, usuario.usuario, email)
     db_usuario = models.UsuarioAdmin(
-        nombre=usuario.nombre,
+        id=uuid.uuid4(),
+        nombre=usuario.nombre.strip(),
+        usuario=usuario.usuario,
         email=email,
         rol=rol,
+        activo=True,
         hash_password=auth.get_password_hash(usuario.password),
-        empresa_id=_empresa_id_or_500(current_user),
+        empresa_id=empresa_id,
     )
     db.add(db_usuario)
+    db.flush()
+    if rol == ROL_SUPERVISOR:
+        _asignar_obras(db, db_usuario, usuario.obras, empresa_id)
     db.commit()
     db.refresh(db_usuario)
-    return db_usuario
+    return _respuesta_usuario(db, db_usuario)
 
 @app.get("/usuarios_admin", response_model=list[schemas.UsuarioAdmin])
 @app.get("/usuarios_admin/", response_model=list[schemas.UsuarioAdmin], include_in_schema=False)
 def read_usuarios_admin(
-    skip: int = 0,
-    limit: int = 50,
     db: Session = Depends(get_db),
-    current_user: models.UsuarioAdmin = Depends(solo_admin),
+    current_user: models.UsuarioAdmin = Depends(gestion),
 ):
-    return (
+    usuarios = (
         db.query(models.UsuarioAdmin)
         .filter(models.UsuarioAdmin.empresa_id == _empresa_id_or_500(current_user))
-        .offset(skip)
-        .limit(limit)
+        .order_by(models.UsuarioAdmin.nombre)
         .all()
     )
+    return [_respuesta_usuario(db, u) for u in usuarios]
 
 @app.get("/usuarios_admin/{usuario_id}", response_model=schemas.UsuarioAdmin)
 def read_usuario_admin(
     usuario_id: uuid.UUID,
     db: Session = Depends(get_db),
-    current_user: models.UsuarioAdmin = Depends(solo_admin),
+    current_user: models.UsuarioAdmin = Depends(gestion),
 ):
-    return _get_o_404(db, models.UsuarioAdmin, usuario_id, _empresa_id_or_500(current_user), "UsuarioAdmin")
+    u = _get_o_404(db, models.UsuarioAdmin, usuario_id, _empresa_id_or_500(current_user), "Usuario")
+    return _respuesta_usuario(db, u)
 
 @app.put("/usuarios_admin/{usuario_id}", response_model=schemas.UsuarioAdmin)
 def update_usuario_admin(
     usuario_id: uuid.UUID,
     usuario: schemas.UsuarioAdminUpdate,
     db: Session = Depends(get_db),
-    current_user: models.UsuarioAdmin = Depends(solo_admin)
+    current_user: models.UsuarioAdmin = Depends(gestion)
 ):
-    db_usuario = _get_o_404(db, models.UsuarioAdmin, usuario_id, _empresa_id_or_500(current_user), "UsuarioAdmin")
-    if auth.rol_de(db_usuario) == ROL_SUPERADMIN and auth.rol_de(current_user) != ROL_SUPERADMIN:
-        raise HTTPException(status_code=403, detail="Solo un superadmin puede editar a otro superadmin")
+    empresa_id = _empresa_id_or_500(current_user)
+    db_usuario = _get_o_404(db, models.UsuarioAdmin, usuario_id, empresa_id, "Usuario")
+    _exigir_puede_gestionar(current_user, db_usuario)
     cambios = usuario.model_dump(exclude_unset=True)
+    if db_usuario.id == current_user.id and (cambios.get("activo") is False or "rol" in cambios):
+        raise HTTPException(status_code=400, detail="No puedes cambiar tu propio rol ni desactivarte")
     if "rol" in cambios:
         db_usuario.rol = _validar_rol_asignable(cambios["rol"], current_user)
-    if cambios.get("email"):
-        email = cambios["email"].strip().lower()
-        _email_libre(db, email, excepto_id=db_usuario.id)
+    if "usuario" in cambios and cambios["usuario"]:
+        _identificadores_libres(db, empresa_id, cambios["usuario"], None, excepto_id=db_usuario.id)
+        db_usuario.usuario = cambios["usuario"]
+    if "email" in cambios:
+        email = _normalizar_email(cambios["email"])
+        _identificadores_libres(db, empresa_id, None, email, excepto_id=db_usuario.id)
         db_usuario.email = email
     if cambios.get("nombre"):
-        db_usuario.nombre = cambios["nombre"]
+        db_usuario.nombre = cambios["nombre"].strip()
     if cambios.get("password"):
         db_usuario.hash_password = auth.get_password_hash(cambios["password"])
+    if "activo" in cambios and cambios["activo"] is not None:
+        db_usuario.activo = cambios["activo"]
+    if auth.rol_de(db_usuario) == ROL_SUPERVISOR:
+        if cambios.get("obras") is not None:
+            _asignar_obras(db, db_usuario, cambios["obras"], empresa_id)
+    else:
+        db.query(models.SupervisorObra).filter(models.SupervisorObra.usuario_id == db_usuario.id).delete()
     db.commit()
     db.refresh(db_usuario)
-    return db_usuario
+    return _respuesta_usuario(db, db_usuario)
 
 @app.delete("/usuarios_admin/{usuario_id}")
 def delete_usuario_admin(
     usuario_id: uuid.UUID,
     db: Session = Depends(get_db),
-    current_user: models.UsuarioAdmin = Depends(solo_admin)
+    current_user: models.UsuarioAdmin = Depends(gestion)
 ):
-    db_usuario = _get_o_404(db, models.UsuarioAdmin, usuario_id, _empresa_id_or_500(current_user), "UsuarioAdmin")
+    db_usuario = _get_o_404(db, models.UsuarioAdmin, usuario_id, _empresa_id_or_500(current_user), "Usuario")
     if db_usuario.id == current_user.id:
         raise HTTPException(status_code=400, detail="No puedes eliminar tu propio usuario")
-    if auth.rol_de(db_usuario) == ROL_SUPERADMIN and auth.rol_de(current_user) != ROL_SUPERADMIN:
-        raise HTTPException(status_code=403, detail="Solo un superadmin puede eliminar a otro superadmin")
+    _exigir_puede_gestionar(current_user, db_usuario)
+    db.query(models.SupervisorObra).filter(models.SupervisorObra.usuario_id == db_usuario.id).delete()
+    db.query(models.Marcaje).filter(models.Marcaje.registrado_por == db_usuario.id).update(
+        {models.Marcaje.registrado_por: None}
+    )
     db.delete(db_usuario)
     db.commit()
     return {"ok": True}
+
+# =============================================================================
+# PLATAFORMA (dueño de LaborLog): alta de empresas. No ve datos internos.
+# =============================================================================
+
+def _empresa_plataforma(db: Session, e: models.Empresa) -> schemas.EmpresaPlataforma:
+    def contar(modelo):
+        return db.query(func.count()).select_from(modelo).filter(modelo.empresa_id == e.id).scalar() or 0
+
+    return schemas.EmpresaPlataforma(
+        id=e.id, nombre=e.nombre, codigo=e.slug, activa=e.activa is not False,
+        zona_horaria=e.zona_horaria or models.ZONA_HORARIA_DEFAULT, created_at=e.created_at,
+        usuarios=contar(models.UsuarioAdmin), trabajadores=contar(models.Trabajador),
+        obras=contar(models.Obra), dispositivos=contar(models.Dispositivo),
+    )
+
+def _codigo_libre(db: Session, codigo: str, excepto_id=None):
+    if codigo == CODIGO_PLATAFORMA:
+        raise HTTPException(status_code=422, detail="Ese código está reservado")
+    q = db.query(models.Empresa).filter(func.lower(models.Empresa.slug) == codigo)
+    if excepto_id is not None:
+        q = q.filter(models.Empresa.id != excepto_id)
+    if q.first():
+        raise HTTPException(status_code=409, detail="Ya existe una empresa con ese código")
+
+@app.get("/plataforma/empresas", response_model=list[schemas.EmpresaPlataforma])
+def plataforma_empresas(db: Session = Depends(get_db), _u: models.UsuarioAdmin = Depends(solo_plataforma)):
+    return [_empresa_plataforma(db, e) for e in db.query(models.Empresa).order_by(models.Empresa.nombre).all()]
+
+@app.post("/plataforma/empresas", response_model=schemas.EmpresaPlataforma)
+def plataforma_crear_empresa(
+    datos: schemas.EmpresaNueva,
+    db: Session = Depends(get_db),
+    _u: models.UsuarioAdmin = Depends(solo_plataforma),
+):
+    """Crea una empresa y su primer superadmin (dueño/RRHH), que luego crea a los demás."""
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+    try:
+        ZoneInfo(datos.zona_horaria)
+    except (ZoneInfoNotFoundError, ValueError):
+        raise HTTPException(status_code=422, detail="Zona horaria inválida (formato IANA, ej. America/Guatemala)")
+    _codigo_libre(db, datos.codigo)
+    empresa = models.Empresa(
+        id=uuid.uuid4(), nombre=datos.nombre.strip(), slug=datos.codigo, activa=True,
+        zona_horaria=datos.zona_horaria, created_at=datetime.now(),
+    )
+    db.add(empresa)
+    db.flush()
+    db.add(models.UsuarioAdmin(
+        id=uuid.uuid4(), empresa_id=empresa.id, nombre=datos.superadmin.nombre.strip(),
+        usuario=datos.superadmin.usuario, email=_normalizar_email(datos.superadmin.email),
+        rol=ROL_SUPERADMIN, activo=True, hash_password=auth.get_password_hash(datos.superadmin.password),
+    ))
+    db.commit()
+    logger.info("Empresa creada %s (%s)", empresa.nombre, empresa.slug)
+    return _empresa_plataforma(db, empresa)
+
+@app.put("/plataforma/empresas/{empresa_id}", response_model=schemas.EmpresaPlataforma)
+def plataforma_editar_empresa(
+    empresa_id: uuid.UUID,
+    datos: schemas.EmpresaPlataformaUpdate,
+    db: Session = Depends(get_db),
+    _u: models.UsuarioAdmin = Depends(solo_plataforma),
+):
+    """Cambia nombre o código, o activa/desactiva la empresa (desactivada: nadie entra
+    y sus teléfonos no pueden marcar)."""
+    empresa = db.query(models.Empresa).filter(models.Empresa.id == empresa_id).first()
+    if empresa is None:
+        raise HTTPException(status_code=404, detail="Empresa no encontrada")
+    cambios = datos.model_dump(exclude_unset=True)
+    if cambios.get("codigo"):
+        _codigo_libre(db, cambios["codigo"], excepto_id=empresa.id)
+        empresa.slug = cambios["codigo"]
+    if cambios.get("nombre"):
+        empresa.nombre = cambios["nombre"].strip()
+    if cambios.get("activa") is not None:
+        empresa.activa = cambios["activa"]
+    db.commit()
+    db.refresh(empresa)
+    return _empresa_plataforma(db, empresa)
 
 # =============================================================================
 # FRONTEND (SPA) - solo si existe el build de Flutter Web
@@ -860,7 +1047,7 @@ def delete_usuario_admin(
 
 _SEGMENTOS_API = {
     "api", "docs", "redoc", "openapi.json", "login", "me", "empresas", "trabajadores",
-    "obras", "dispositivos", "marcajes", "usuarios_admin", "planillas", "kiosco",
+    "obras", "dispositivos", "marcajes", "usuarios_admin", "planillas", "kiosco", "plataforma",
 }
 
 @app.get("/", include_in_schema=False)
